@@ -10,13 +10,27 @@ from collections import deque
 from pathlib import Path
 from typing import List, Tuple, Iterable
 
+from modules import scripts
+
 from scripts.video_loopback_utils import utils
 from scripts.video_loopback_utils.utils import \
     resize_img, make_video, is_image, get_image_paths, \
     get_prompt_for_images, blend_average, get_now_time
 from scripts.video_loopback_utils.fastdvdnet_processor import FastDVDNet
 
+from extensions.sd_webui_masactrl.scripts.masactrl_controller import MasaControllerMode
 
+
+
+def update_script_args(p, value, arg_idx, script_class):
+
+    for s in scripts.scripts_txt2img.alwayson_scripts:
+        if isinstance(s, script_class):
+            args = list(p.script_args)
+            # print(f"Changed arg {arg_idx} from {args[s.args_from + arg_idx - 1]} to {value}")
+            args[s.args_from + arg_idx] = value
+            p.script_args = tuple(args)
+            break
 def gr_show(visible=True):
     return {"visible": visible, "__type__": "update"}
 
@@ -224,8 +238,8 @@ class Script(modules.scripts.Script):
         output_frame_rate = gr.Number(label='output_frame_rate', precision=0, value=30)
         max_frames = gr.Number(label='max_frames', precision=0, value=9999)
         extract_nth_frame = gr.Number(label='extract_nth_frame', precision=0, value=1)
-        is_continue = gr.Checkbox(
-            label='is_continue (ignore the "extract_nth_frame" for input frames only)', value=False
+        is_continuous = gr.Checkbox(
+            label='is_continuous (ignore the "extract_nth_frame" for input frames only)', value=False
         )
         loop_n = gr.Number(label='loop_n', precision=0, value=10)
         superimpose_alpha = gr.Slider(label='superimpose_alpha', minimum=0, maximum=1, step=0.01, value=0.25)
@@ -248,6 +262,14 @@ class Script(modules.scripts.Script):
                         'Split you paths with "!!!" if you are using multi-Controlnet. '
         )
         save_every_loop = gr.Checkbox(label='save_every_loop', value=True)
+
+        # MASAControl settings
+        masa_control_use_index = gr.Checkbox(label='masa_control_use_index', value=False)
+        masa_control_active_range = gr.Textbox(
+            label='masa_control_active_range',
+            value='0-100,102-110;135-145',
+            placeholder='Example: 0,0.5'
+        )
 
         # extra settings
         with gr.Accordion('**Advanced Settings of Video Loopback:**', open=True):
@@ -338,7 +360,7 @@ class Script(modules.scripts.Script):
             output_frame_rate,
             max_frames,
             extract_nth_frame,
-            is_continue,
+            is_continuous,
             loop_n,
             superimpose_alpha,
             fix_seed,
@@ -347,6 +369,8 @@ class Script(modules.scripts.Script):
             temporal_superimpose_alpha_list,
             reference_frames_dir,
             save_every_loop,
+            masa_control_use_index,
+            masa_control_active_range,
             subseed_strength_schedule,
             denoising_schedule,
             step_schedule,
@@ -374,7 +398,7 @@ class Script(modules.scripts.Script):
             output_frame_rate,
             max_frames,
             extract_nth_frame,
-            is_continue,
+            is_continuous,
             loop_n,
             superimpose_alpha,
             fix_seed,
@@ -383,6 +407,8 @@ class Script(modules.scripts.Script):
             temporal_superimpose_alpha_list,
             reference_frames_dir,
             save_every_loop,
+            masa_control_use_index,
+            masa_control_active_range,
             subseed_strength_schedule,
             denoising_schedule,
             step_schedule,
@@ -425,7 +451,7 @@ class Script(modules.scripts.Script):
             "output_frame_rate": output_frame_rate,
             "max_frames": max_frames,
             "extract_nth_frame": extract_nth_frame,
-            "is_continue": is_continue,
+            "is_continuous": is_continuous,
             "loop_n": loop_n,
             "superimpose_alpha": superimpose_alpha,
             "fix_seed": fix_seed,
@@ -434,6 +460,8 @@ class Script(modules.scripts.Script):
             "temporal_superimpose_alpha_list": temporal_superimpose_alpha_list,
             "reference_frames_dir": reference_frames_dir,
             "save_every_loop": save_every_loop,
+            "masa_control_use_index": masa_control_use_index,
+            "masa_control_active_range": masa_control_active_range,
             "subseed_strength_schedule": subseed_strength_schedule,
             "denoising_schedule": denoising_schedule,
             "step_schedule": step_schedule,
@@ -490,7 +518,7 @@ class Script(modules.scripts.Script):
             image_list = [input_dir] * max_frames
         else:
             image_list = get_image_paths(input_dir)
-            if not is_continue:
+            if not is_continuous:
                 image_list = image_list[::extract_nth_frame]
             image_list = image_list[:max_frames]
         image_n = len(image_list)
@@ -538,6 +566,36 @@ class Script(modules.scripts.Script):
             for image_list in reference_image_list
         ]
 
+
+        def parse_ranges(text):
+            sections = text.split(';')
+            sections_list = []
+            for section in sections:
+                intervals_list = []
+                intervals = section.split(',')
+                for interval in intervals:
+                    start, end = map(int, interval.split('-'))
+                    intervals_list.append([start, end])
+                sections_list.append(intervals_list)
+            return sections_list
+        masa_ctrl_logging_list = []
+        masa_ctrl_logrecon_list = []
+
+        if masa_control_active_range != "":
+            masa_ctrl_sections_list = parse_ranges(masa_control_active_range)
+
+            for section in masa_ctrl_sections_list:
+                intervals_list = section
+                masa_ctrl_logging_list.append(intervals_list[0][0])
+                for i, interval in enumerate(intervals_list):
+                    if not i == 0:
+                        masa_ctrl_logrecon_list.append(interval[0])
+                    masa_ctrl_logrecon_list.extend(list(range(interval[0]+1, interval[1]+1)))
+
+
+
+
+
         for loop_i in range(loop_n):
             if shared.state.interrupted:
                 break
@@ -567,6 +625,23 @@ class Script(modules.scripts.Script):
 
                 # do all schedule
                 schedule_args.update({'image_i': image_i+1, 'loop_i': loop_i+1})
+
+                target_masactrl_script_object = next(
+                    (v for v in scripts.scripts_img2img.scripts if str(v).startswith('<masactrl_ui.py.Script')), None)
+
+                if masa_control_use_index:
+                    input_img_stem = image_i
+                else:
+                    input_img_stem = int(Path(image_path).stem)
+
+                if masa_control_active_range != "":
+                    if input_img_stem in masa_ctrl_logging_list:
+                        update_script_args(p, MasaControllerMode.LOGGING,0,target_masactrl_script_object.__class__)
+                    elif input_img_stem in masa_ctrl_logrecon_list:
+                        update_script_args(p, MasaControllerMode.LOGRECON,0,target_masactrl_script_object.__class__)
+                    else:
+                        update_script_args(p, MasaControllerMode.IDLE,0,target_masactrl_script_object.__class__)
+
                 if subseed_strength_schedule:
                     p.subseed_strength = eval(subseed_strength_schedule, schedule_args)
                     print(f"subseed_strength_schedule:{p.subseed_strength}")
@@ -650,6 +725,11 @@ class Script(modules.scripts.Script):
                 ]
 
                 processed = processing.process_images(p)
+
+                # masactrl post process
+                if masa_control_active_range != "":
+                    if input_img_stem in masa_ctrl_logging_list + masa_ctrl_logrecon_list:
+                        shared.masa_controller.calculate_reconstruction_maps()
 
                 processed_imgs = processed.images
                 processed_imgs = [

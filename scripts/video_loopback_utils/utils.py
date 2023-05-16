@@ -63,7 +63,7 @@ def blend_average(img_iter: Iterable[Image.Image]) -> Image.Image:
     for i, img in enumerate(img_iter, 1):
         new_img = Image.blend(new_img, img, 1.0 / (i + 1))
     return new_img
-
+# uhhh what
 
 def get_now_time() -> str:
     SHA_TZ = datetime.timezone(
